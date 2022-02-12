@@ -1,7 +1,7 @@
 /**
  * Implement the HttpRequest to Canisters Proposal.
  */
-import { Actor, HttpAgent, QueryResponseStatus } from '@dfinity/agent';
+import { Actor, ActorSubclass, HttpAgent, QueryResponseStatus } from '@dfinity/agent';
 import { IDL } from '@dfinity/candid';
 import { Principal } from '@dfinity/principal';
 import { validateBody } from './validation';
@@ -189,6 +189,21 @@ const canisterIdlFactory: IDL.InterfaceFactory = ({ IDL }) => {
 
   return IDL.Service({
     http_request: IDL.Func([HttpRequest], [HttpResponse], ['query']),
+
+    // TODO PR#1 remove after pr
+    get: IDL.Func(
+      [IDL.Record({ key: IDL.Text, accept_encodings: IDL.Vec(IDL.Text) })],
+      [
+        IDL.Record({
+          content: IDL.Vec(IDL.Nat8),
+          sha256: IDL.Opt(IDL.Vec(IDL.Nat8)),
+          content_type: IDL.Text,
+          content_encoding: IDL.Text,
+          total_length: IDL.Nat,
+        }),
+      ],
+      ['query'],
+    ),
   });
 };
 
@@ -211,6 +226,150 @@ function decodeBody(body: Uint8Array, encoding: string): Uint8Array {
   }
 }
 
+// TODO remove after PR#2-3
+let chunkInfoCache: Record<string, Record<number, number>> = {};
+
+interface FetchRangePayload {
+  url: URL;
+  canisterId: Principal;
+  actor: ActorSubclass;
+  agent: HttpAgent;
+  request: Request;
+}
+
+export const getSteamingChunksResponse = async (p: FetchRangePayload): Promise<Response> => {
+  console.log('Request ' + p.url.pathname, p.request?.headers?.get('Range'));
+  const res = await _getSteamingChunksResponse(p);
+  console.log('Response ' + p.url.pathname, { status: res.status, headers: res.headers.get('Content-Range') });
+  return res;
+};
+
+const _getSteamingChunksResponse = async ({
+	url, actor, agent, request, canisterId
+}: FetchRangePayload): Promise<Response> => {
+  console.log('Oookey lets go');
+  const src = url.pathname;
+  
+  const headers: [string, string][] = [];
+  // FIXME bad practice
+  (request.headers || new Headers()).forEach((value, key) => {
+    headers.push([key, value]);
+  });
+
+  const httpRequest = {
+    method: request.method || 'GET',
+    url: url.pathname + url.search,
+    headers,
+    body: request.arrayBuffer ? [...new Uint8Array(await request.arrayBuffer())] : [],
+  };
+
+	const response: any = await actor.http_request(httpRequest);
+
+	const firstChunk = new Uint8Array(response.body);
+	const rangeHeader = headers.find(([key]) => key.toLowerCase() == 'range');
+
+	if (!rangeHeader) {
+		const data = await fetchBody(canisterId, agent, response);
+
+    return new Response(data, { status: response.status_code, headers: [
+      ...response.headers,
+			['Content-Length', `${data.length}`]
+		] });
+	}
+
+  // TODO PR#1 add to certified_assets PR for adding total length into content-length header or `total_length` to HttpResponse object
+  // OR live without size
+	// const contentLengthHeader = response.headers.find(([key]) => key.toLowerCase() == 'content-length');
+  // const size = contentLengthHeader ? Number(contentLengthHeader[1]) : 0;
+  const keyForGet = url.pathname == '/' ? '/index.html' : url.pathname;
+  const { total_length }: any = await actor.get({ key: keyForGet, accept_encodings: ['identity'] });
+  const size = Number(total_length);
+
+  // FIXME remove after PR#2-3
+  if (!chunkInfoCache[src]) {
+    chunkInfoCache[src] = {
+      0: firstChunk.length,
+    };
+  }
+  // FIXME remove after PR#2-3
+  const cachedSize = Object.values(chunkInfoCache[src]).reduce((acc, next) => acc + next, 0);
+  if (cachedSize !== size) {
+    console.log('!!! FIXME PR#2 and 3 lets cache');
+    await fetchBody(canisterId, agent, response, ({data, index}) => {
+      chunkInfoCache[src][index] = data.length;
+    });
+  }
+
+  // FIXME bad practice
+  const start = Number(rangeHeader[1].split('bytes=')[1].split('-')[0]);
+  const callback = getCallbackToken(response);
+
+  if (!callback || !chunkInfoCache[src]) {
+    return new Response(firstChunk, { status: 206, headers: [
+      ...response.headers,
+      ['Content-Range', `bytes 0-${firstChunk.length}/${firstChunk.length + 1}`]
+    ]});
+  }
+
+  const { token, methodName } = callback;
+
+  let reduced = 0;
+  const entry = Object.entries(chunkInfoCache[src]).find(entry => {
+    reduced += entry[1];
+
+    return start < reduced;
+  });
+
+  if (!entry) {
+    console.log('Return no entry', { start });
+    return new Response(null, { status: 216, headers: response.headers });
+  }
+
+  console.log('Current entry', entry);
+  if (entry[0] == '0') {
+    // FIXME DRY
+    return new Response(firstChunk, { status: 206, headers: [
+      ...response.headers,
+      ['Content-Range', `bytes 0-${firstChunk.length}/${size + 1}`]
+    ]});
+  }
+
+  const encodedResponse = await agent.query(canisterId, {
+    methodName,
+    arg: IDL.encode([StreamingCallbackToken], [{
+      ...token,
+      index: BigInt(entry[0])
+    }]),
+  });
+
+  if (encodedResponse.status != 'rejected') {
+    const decoded = IDL.decode(
+      [StreamingCallbackHttpResponse],
+      encodedResponse.reply.arg
+    );
+  
+    const decodedResponse = decoded[0] as any;
+  
+    const bytes: number[] = decodedResponse?.body || [];
+  
+    return new Response(new Uint8Array(bytes), { status: 206, headers: [
+      ...response.headers,
+      ['Content-Range', `bytes ${reduced - entry[1]}-${reduced}/${size + 1}`]
+    ] });
+  }
+
+  const statusText = `${encodedResponse.reject_code}: ${encodedResponse.reject_message}`;
+  console.error(statusText);
+  return new Response(null, { status: 216, statusText, headers: response.headers });
+
+  // TODO PR#2 HttpResponse.streaming_strategy need to return all chunks tokens for build manual download strategy
+  // TODO PR#3 - need to know the size (bytes length) of any chunk from token
+  // all 3 TODOs might be resolved as:
+  // add `chunks` and `total_length` fields to HttpResponse object
+  // HttpResponse.chunks: { [key: bigint]: number }, where is { index: content_length }
+  // HttpResponse.total_length: number
+};
+
 /**
  * Fetch and merge body chunks
  * @param canisterId Canister which contains chunks
@@ -220,22 +379,19 @@ function decodeBody(body: Uint8Array, encoding: string): Uint8Array {
  export async function fetchBody(
   canisterId: Principal,
   agent: HttpAgent,
-  httpResponse: any
+  httpResponse: any,
+  onChunkDownloaded: ({data: Uint8Array, index: number, done: boolean}) => void = () => {},
 ): Promise<Uint8Array> {
   let body = new Uint8Array(httpResponse.body);
 
-  if (!('streaming_strategy' in httpResponse)) {
+  const callback = getCallbackToken(httpResponse);
+  if (!callback) {
     return body;
   }
 
-  const strategy = httpResponse.streaming_strategy[0];
-  if (!strategy) {
-    return body;
-  }
+  let token = callback.token;
+  const methodName = callback.methodName;
 
-  const [_, methodName]: [any, string] = strategy.Callback?.callback || [];
-
-  let token = strategy.Callback?.token;
   while (!!token) {
     try {
       const encodedResponse = await agent.query(canisterId, {
@@ -253,13 +409,16 @@ function decodeBody(body: Uint8Array, encoding: string): Uint8Array {
       );
 
       const bytes: number[] = decodedResponse?.body || [];
+      const nextToken = decodedResponse.token ? decodedResponse.token[0] : undefined;
+
+      onChunkDownloaded({data: new Uint8Array(bytes), index: Number(token?.index), done: !token});
 
       const mergedBody = new Uint8Array(body.length + bytes.length);
       mergedBody.set(body);
       mergedBody.set(bytes, body.length);
       body = mergedBody;
+      token = nextToken;
 
-      token = decodedResponse.token ? decodedResponse.token[0] : undefined;
     } catch (e) {
       body = new Uint8Array(httpResponse.body);
       break;
@@ -268,6 +427,27 @@ function decodeBody(body: Uint8Array, encoding: string): Uint8Array {
 
   return body;
 }
+
+const getCallbackToken = (response: any) => {
+  if (!('streaming_strategy' in response)) {
+    return null;
+  }
+
+  const strategy = response.streaming_strategy[0];
+  if (!strategy) {
+    return null;
+  }
+
+  const [_, methodName] = strategy.Callback.callback;
+
+  const token = strategy.Callback.token;
+
+  if (!token) {
+    return null;
+  }
+
+  return { methodName, token };
+};
 
 /**
  * Box a request, send it to the canister, and handle its response, creating a Response
@@ -322,20 +502,22 @@ export async function handleRequest(request: Request): Promise<Response> {
         requestHeaders.push(['Accept-Encoding', 'gzip, deflate, identity']);
       }
 
-      const httpRequest = {
-        method: request.method,
-        url: url.pathname + url.search,
-        headers: requestHeaders,
-        body: [...new Uint8Array(await request.arrayBuffer())],
-      };
-
-      const httpResponse: any = await actor.http_request(httpRequest);
+      const httpResponse = await getSteamingChunksResponse({
+        url,
+        actor,
+        agent,
+        request,
+        canisterId: maybeCanisterId
+      });
+      
+      // const httpResponse: any = await actor.http_request(httpRequest);
       const headers = new Headers();
 
       let certificate: ArrayBuffer | undefined;
       let tree: ArrayBuffer | undefined;
       let encoding = '';
-      for (const [key, value] of httpResponse.headers) {
+
+      httpResponse.headers.forEach((value, key) => {
         switch (key.trim().toLowerCase()) {
           case 'ic-certificate':
             {
@@ -343,7 +525,7 @@ export async function handleRequest(request: Request): Promise<Response> {
               for (const f of fields) {
                 const [_0, name, b64Value] = [...f.match(/^(.*)=:(.*):$/)].map(x => x.trim());
                 const value = base64Arraybuffer.decode(b64Value);
-
+  
                 if (name === 'certificate') {
                   certificate = value;
                 } else if (name === 'tree') {
@@ -351,16 +533,17 @@ export async function handleRequest(request: Request): Promise<Response> {
                 }
               }
             }
-            continue;
+            return;
           case 'content-encoding':
             encoding = value.trim();
             break;
         }
-
+  
         headers.append(key, value);
-      }
+      });
 
-      const body = await fetchBody(maybeCanisterId, agent, httpResponse);
+      const body = new Uint8Array(await httpResponse.arrayBuffer());
+
       const identity = decodeBody(body, encoding);
 
       let bodyValid = false;
@@ -392,7 +575,7 @@ export async function handleRequest(request: Request): Promise<Response> {
       }
       if (bodyValid) {
         return new Response(identity.buffer, {
-          status: httpResponse.status_code,
+          status: httpResponse.status,
           headers,
         });
       } else {

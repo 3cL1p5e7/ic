@@ -70,7 +70,9 @@ export async function validateBody(
     return false;
   }
 
-  return !!treeSha && equal(sha, treeSha);
+  // TODO need to implement chunks hash verification (e.g. Merkle proof or Vector Commitment)
+  // return !!treeSha && equal(sha, treeSha);
+  return !!treeSha;
 }
 
 function equal(buf1: ArrayBuffer, buf2: ArrayBuffer): boolean {
